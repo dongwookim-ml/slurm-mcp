@@ -38,7 +38,7 @@ echo ""
 echo "To test the server locally:"
 echo "  cd $SCRIPT_DIR && .venv/bin/python server.py"
 echo ""
-echo "To configure Claude Code on your LOCAL machine, add to ~/.claude/settings.json:"
+echo "To configure Claude Code on your LOCAL machine, add to ~/.claude.json:"
 echo ""
 echo '  {
     "mcpServers": {

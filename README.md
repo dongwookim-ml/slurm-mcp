@@ -25,7 +25,7 @@ bash setup.sh
 
 ### 2. Configure Claude Code on your local machine
 
-Add to `~/.claude/settings.json`:
+Add to `~/.claude.json`:
 
 ```json
 {
