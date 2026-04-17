@@ -23,7 +23,14 @@ ssh user@cluster "cd /path/to/slurm-mcp && .venv/bin/python server.py"
 
 **Dependency**: `mcp>=1.0.0` (installed via `pip install -r requirements.txt`)
 
-**No tests, linting, or formatting tools are configured.**
+## Tests
+
+```bash
+pip install -r requirements-dev.txt   # pytest + pytest-asyncio
+pytest                                 # runs tests/ (config: pytest.ini)
+```
+
+Tests cover the pure helpers (`_has_qos_flag`, `_inject_preamble`, `_storage_warnings`) and `_poll_job_state` with a monkeypatched `_run`. They do not require a live Slurm cluster — `tests/conftest.py` stubs the `mcp` package so the suite runs anywhere with Python 3.10+.
 
 ## Architecture
 
