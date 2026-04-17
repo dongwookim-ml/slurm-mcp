@@ -6,9 +6,13 @@ Via SSH:       ssh user@cluster "cd /path/to/slurm-mcp && .venv/bin/python serve
 """
 
 import asyncio
+import json
 import os
 import shlex
 import tempfile
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -22,6 +26,24 @@ HOME_DIR = os.environ.get("SLURM_MCP_HOME_DIR", f"/home1/{USER}")
 DATA_DIR = os.environ.get("SLURM_MCP_DATA_DIR", f"/home/{USER}")
 SCRATCH_DIR = os.environ.get("SLURM_MCP_SCRATCH_DIR", "/scratch")
 HOME_QUOTA_GB = int(os.environ.get("SLURM_MCP_HOME_QUOTA_GB", "500"))
+
+# Shell lines injected into inline job scripts after the shebang. Use for
+# module loads, conda activation, etc. Ignored when submitting an existing
+# script_path.
+PREAMBLE = os.environ.get("SLURM_MCP_PREAMBLE", "").strip()
+
+# Webhook URL for job-completion notifications (Slack/Discord-compatible).
+NOTIFY_WEBHOOK = os.environ.get("SLURM_MCP_NOTIFY_WEBHOOK", "").strip()
+
+# Partitions that require --qos=hpgpu on this cluster. Auto-injected when
+# a caller targets one without specifying --qos in extra_args.
+HPGPU_PARTITIONS = {"A100-40GB", "A100-80GB", "4A100"}
+
+# Terminal sacct states — stop polling once a watched job reaches one.
+TERMINAL_STATES = {
+    "COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL",
+    "OUT_OF_MEMORY", "BOOT_FAIL", "PREEMPTED", "DEADLINE",
+}
 
 # File extensions that indicate "large data" (should NOT live in HOME_DIR)
 DATA_EXTENSIONS = {
@@ -74,6 +96,51 @@ def _storage_warnings(file_path: str, content_size: int = 0) -> list[str]:
         )
 
     return warnings
+
+
+def _has_qos_flag(extra_args: str | None) -> bool:
+    if not extra_args:
+        return False
+    tokens = shlex.split(extra_args)
+    for tok in tokens:
+        if tok == "--qos" or tok == "-q" or tok.startswith("--qos="):
+            return True
+    return False
+
+
+def _inject_preamble(script_content: str) -> str:
+    """Prepend PREAMBLE shell lines after the shebang (or at the top)."""
+    if not PREAMBLE:
+        return script_content
+    lines = script_content.splitlines(keepends=True)
+    if lines and lines[0].startswith("#!"):
+        return lines[0] + PREAMBLE + "\n" + "".join(lines[1:])
+    return "#!/bin/bash\n" + PREAMBLE + "\n" + script_content
+
+
+def _post_webhook_sync(url: str, payload: dict) -> tuple[bool, str]:
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return 200 <= resp.status < 300, f"HTTP {resp.status}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}"
+    except Exception as e:
+        return False, str(e)
+
+
+async def _notify(message: str) -> tuple[bool, str]:
+    """Send a webhook notification. Returns (ok, detail)."""
+    if not NOTIFY_WEBHOOK:
+        return False, "NOTIFY_WEBHOOK not configured"
+    # Slack uses "text"; Discord uses "content". Sending both is harmless.
+    payload = {"text": message, "content": message}
+    return await asyncio.to_thread(_post_webhook_sync, NOTIFY_WEBHOOK, payload)
 
 
 async def _run(
@@ -133,10 +200,15 @@ async def submit_job(
     if not script_path and not script_content:
         return "Error: Provide either script_path or script_content."
 
-    # Write inline content to a temp file
+    injected_notes: list[str] = []
+
+    # Write inline content to a temp file (with optional preamble injection)
     if script_content:
         if not script_content.startswith("#!"):
             script_content = "#!/bin/bash\n" + script_content
+        if PREAMBLE:
+            script_content = _inject_preamble(script_content)
+            injected_notes.append("preamble injected")
         tmp_dir = working_dir or HOME_DIR
         fd, tmp_path = tempfile.mkstemp(suffix=".sh", dir=tmp_dir, prefix="slurm_job_")
         with os.fdopen(fd, "w") as f:
@@ -144,12 +216,18 @@ async def submit_job(
         os.chmod(tmp_path, 0o755)
         script_path = tmp_path
 
+    # Auto-inject --qos=hpgpu for partitions that require it
+    auto_qos = partition in HPGPU_PARTITIONS and not _has_qos_flag(extra_args)
+
     # Build sbatch command
     cmd: list[str] = ["sbatch"]
     if job_name:
         cmd += ["--job-name", job_name]
     if partition:
         cmd += ["--partition", partition]
+    if auto_qos:
+        cmd += ["--qos", "hpgpu"]
+        injected_notes.append(f"auto --qos=hpgpu for partition {partition}")
     if gpus:
         cmd += ["--gpus", gpus]
     cmd += ["--nodes", str(nodes), "--ntasks", str(ntasks)]
@@ -171,6 +249,8 @@ async def submit_job(
         msg = f"Job submitted: {stdout}"
         if script_content:
             msg += f"\nScript saved to: {script_path}"
+        if injected_notes:
+            msg += f"\nAuto-injected: {', '.join(injected_notes)}"
         return msg
     return f"Submission failed (exit {rc})\nstdout: {stdout}\nstderr: {stderr}"
 
@@ -297,6 +377,153 @@ async def tail_output(
         return header + "\n" + "".join(tail)
     except Exception as e:
         return f"Error reading {file_path}: {e}"
+
+
+# ===================================================================
+# Job Watcher — background polling with webhook notifications
+# ===================================================================
+
+_watchers: dict[str, dict] = {}
+
+
+async def _poll_job_state(job_id: str) -> tuple[str, str]:
+    """Return (state, summary). State is SACCT state; summary includes key fields."""
+    fmt = "JobID,JobName,State,ExitCode,Elapsed,MaxRSS,NodeList"
+    out, err, rc = await _run(
+        ["sacct", "-j", str(job_id), f"--format={fmt}", "--parsable2", "--noheader"],
+        timeout=15,
+    )
+    if rc != 0 or not out:
+        return "UNKNOWN", err or "no sacct output"
+
+    # Use the first row (the parent step) for state; it's the canonical job state.
+    first = out.splitlines()[0].split("|")
+    fields = fmt.split(",")
+    info = dict(zip(fields, first))
+    state_raw = info.get("State", "UNKNOWN")
+    # sacct appends " by <uid>" on CANCELLED; strip.
+    state = state_raw.split()[0] if state_raw else "UNKNOWN"
+
+    summary_lines = [
+        f"Job: {info.get('JobID', job_id)} ({info.get('JobName', '')})",
+        f"State: {state_raw}",
+        f"ExitCode: {info.get('ExitCode', '')}",
+        f"Elapsed: {info.get('Elapsed', '')}",
+    ]
+    if info.get("NodeList"):
+        summary_lines.append(f"Nodes: {info['NodeList']}")
+    # MaxRSS often lives on the .batch step; scan for it.
+    for row in out.splitlines():
+        parts = row.split("|")
+        if len(parts) > fields.index("MaxRSS") and parts[fields.index("MaxRSS")]:
+            summary_lines.append(f"MaxRSS: {parts[fields.index('MaxRSS')]}")
+            break
+    return state, "\n".join(summary_lines)
+
+
+async def _watch_loop(job_id: str, interval: int) -> None:
+    info = _watchers[job_id]
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            state, summary = await _poll_job_state(job_id)
+            info["last_state"] = state
+            info["last_check"] = time.time()
+            if state in TERMINAL_STATES:
+                info["final_summary"] = summary
+                message = f"[slurm-mcp] Job {job_id} {state}\n{summary}"
+                ok, detail = await _notify(message)
+                info["notified"] = ok
+                info["notify_detail"] = detail
+                return
+    except asyncio.CancelledError:
+        info["last_state"] = info.get("last_state", "CANCELLED_WATCH")
+        raise
+    finally:
+        info["finished_at"] = time.time()
+
+
+@mcp.tool()
+async def watch_job(job_id: str, interval: int = 30) -> str:
+    """Register a background watcher that polls a job and fires a webhook on completion.
+
+    Polls every ``interval`` seconds (min 10). Notifies via ``SLURM_MCP_NOTIFY_WEBHOOK``
+    when the job reaches a terminal state (COMPLETED, FAILED, TIMEOUT, CANCELLED, …).
+    Watchers live for the lifetime of the MCP server process; restarting loses them.
+    Returns immediately — use ``list_watches`` to inspect status.
+    """
+    interval = max(10, int(interval))
+    job_id = str(job_id).strip()
+
+    if job_id in _watchers and not _watchers[job_id].get("finished_at"):
+        return f"Job {job_id} is already being watched."
+
+    state, summary = await _poll_job_state(job_id)
+    if state == "UNKNOWN":
+        return f"Could not find job {job_id} in sacct. Not watching."
+
+    if state in TERMINAL_STATES:
+        # Already done — fire once and record.
+        message = f"[slurm-mcp] Job {job_id} {state} (already terminal)\n{summary}"
+        ok, detail = await _notify(message)
+        _watchers[job_id] = {
+            "started_at": time.time(),
+            "finished_at": time.time(),
+            "interval": interval,
+            "last_state": state,
+            "final_summary": summary,
+            "notified": ok,
+            "notify_detail": detail,
+            "task": None,
+        }
+        webhook_line = (
+            f"Webhook: {'sent' if ok else f'skipped ({detail})'}"
+        )
+        return f"Job {job_id} is already {state}; no polling needed.\n{webhook_line}\n\n{summary}"
+
+    _watchers[job_id] = {
+        "started_at": time.time(),
+        "finished_at": None,
+        "interval": interval,
+        "last_state": state,
+        "last_check": time.time(),
+        "final_summary": None,
+        "notified": None,
+        "notify_detail": None,
+    }
+    task = asyncio.create_task(_watch_loop(job_id, interval))
+    _watchers[job_id]["task"] = task
+
+    webhook_status = "configured" if NOTIFY_WEBHOOK else "NOT configured (set SLURM_MCP_NOTIFY_WEBHOOK)"
+    return (
+        f"Watching job {job_id} (current state: {state}, interval: {interval}s). "
+        f"Webhook: {webhook_status}."
+    )
+
+
+@mcp.tool()
+async def list_watches() -> str:
+    """List active and completed job watchers in this server process."""
+    if not _watchers:
+        return "No watchers registered."
+
+    now = time.time()
+    rows = ["JobID | State | Interval | Age | Notified"]
+    rows.append("-" * 70)
+    for job_id, info in _watchers.items():
+        age = int(now - info["started_at"])
+        notified = info.get("notified")
+        if notified is None:
+            notif = "pending"
+        elif notified is True:
+            notif = "sent"
+        else:
+            notif = f"failed ({info.get('notify_detail', '')})"
+        rows.append(
+            f"{job_id} | {info.get('last_state', '?')} | "
+            f"{info['interval']}s | {age}s | {notif}"
+        )
+    return "\n".join(rows)
 
 
 # ===================================================================

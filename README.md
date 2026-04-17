@@ -7,6 +7,9 @@ The server runs on your cluster's login node and exposes Slurm operations, file 
 ## Features
 
 - **Job Management** — submit (`sbatch`), list (`squeue`), cancel (`scancel`), status (`sacct`), and tail output
+- **Job Watcher** — background polling with webhook notification on terminal state
+- **Preamble Injection** — prepend module loads / env setup into every inline job script
+- **Auto-QOS** — automatic `--qos=hpgpu` when targeting partitions that require it
 - **File Operations** — read, write, edit, search, and delete files with storage policy enforcement
 - **Cluster Info** — partition overview, node states, GPU availability
 - **Shell Access** — run arbitrary commands with safety guardrails
@@ -56,12 +59,13 @@ Once configured, Claude Code can directly interact with your cluster:
 | Category | Tools |
 |----------|-------|
 | **Slurm Jobs** | `submit_job`, `list_jobs`, `cancel_job`, `job_status`, `tail_output` |
+| **Watchers** | `watch_job`, `list_watches` |
 | **File Ops** | `read_file`, `write_file`, `edit_file`, `search_files`, `delete_file`, `disk_usage` |
 | **System** | `run_command`, `sync_code`, `cluster_info` |
 
 ## Configuration
 
-All paths are configurable via environment variables, making it work on any cluster:
+> Targeted at the **ai2 HPC cluster** — partition names and QOS rules are baked into the code (see `HPGPU_PARTITIONS` in `server.py` and the QOS policy notes in `CLAUDE.md`). Paths below are configurable, but the cluster-specific assumptions are not.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -69,6 +73,22 @@ All paths are configurable via environment variables, making it work on any clus
 | `SLURM_MCP_DATA_DIR` | `/home/$USER` | Data storage directory |
 | `SLURM_MCP_SCRATCH_DIR` | `/scratch` | Temporary staging area |
 | `SLURM_MCP_HOME_QUOTA_GB` | `500` | Home quota threshold for warnings |
+| `SLURM_MCP_PREAMBLE` | *(empty)* | Shell lines injected after the shebang into inline job scripts (e.g. `module load cuda/12.1\nsource ~/.venv/bin/activate`) |
+| `SLURM_MCP_NOTIFY_WEBHOOK` | *(empty)* | Slack/Discord-compatible webhook URL used by `watch_job` on terminal state |
+
+### Auto-QOS
+
+When `submit_job` targets a partition in `{A100-40GB, A100-80GB, 4A100}` and no
+`--qos` appears in `extra_args`, `--qos=hpgpu` is added automatically. Pass
+`--qos=<other>` in `extra_args` to override.
+
+### Watchers
+
+`watch_job <id>` registers an async watcher that polls `sacct` every 30 s
+(configurable). When the job reaches a terminal state (`COMPLETED`, `FAILED`,
+`TIMEOUT`, `CANCELLED`, `OUT_OF_MEMORY`, …) the server posts a summary to
+`SLURM_MCP_NOTIFY_WEBHOOK`. Watchers live in-process and are lost if the server
+restarts. Use `list_watches` to inspect state.
 
 Set these in your shell profile or pass them when running the server:
 
