@@ -6,13 +6,10 @@ Via SSH:       ssh user@cluster "cd /path/to/slurm-mcp && .venv/bin/python serve
 """
 
 import asyncio
-import json
 import os
 import shlex
 import tempfile
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -31,9 +28,6 @@ HOME_QUOTA_GB = int(os.environ.get("SLURM_MCP_HOME_QUOTA_GB", "500"))
 # module loads, conda activation, etc. Ignored when submitting an existing
 # script_path.
 PREAMBLE = os.environ.get("SLURM_MCP_PREAMBLE", "").strip()
-
-# Webhook URL for job-completion notifications (Slack/Discord-compatible).
-NOTIFY_WEBHOOK = os.environ.get("SLURM_MCP_NOTIFY_WEBHOOK", "").strip()
 
 # Partitions that require --qos=hpgpu on this cluster. Auto-injected when
 # a caller targets one without specifying --qos in extra_args.
@@ -116,31 +110,6 @@ def _inject_preamble(script_content: str) -> str:
     if lines and lines[0].startswith("#!"):
         return lines[0] + PREAMBLE + "\n" + "".join(lines[1:])
     return "#!/bin/bash\n" + PREAMBLE + "\n" + script_content
-
-
-def _post_webhook_sync(url: str, payload: dict) -> tuple[bool, str]:
-    try:
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return 200 <= resp.status < 300, f"HTTP {resp.status}"
-    except urllib.error.HTTPError as e:
-        return False, f"HTTP {e.code}"
-    except Exception as e:
-        return False, str(e)
-
-
-async def _notify(message: str) -> tuple[bool, str]:
-    """Send a webhook notification. Returns (ok, detail)."""
-    if not NOTIFY_WEBHOOK:
-        return False, "NOTIFY_WEBHOOK not configured"
-    # Slack uses "text"; Discord uses "content". Sending both is harmless.
-    payload = {"text": message, "content": message}
-    return await asyncio.to_thread(_post_webhook_sync, NOTIFY_WEBHOOK, payload)
 
 
 async def _run(
@@ -455,8 +424,8 @@ async def _poll_job_state(job_id: str) -> tuple[str, str]:
 async def _watch_loop(job_id: str, interval: int) -> None:
     info = _watchers[job_id]
     # Tolerate a few UNKNOWN polls: job may have just finished before sacct
-    # indexed it, or slurmdbd may be flaky. After this many in a row we assume
-    # the job is gone and notify with a caveat.
+    # indexed it, or slurmdbd may be flaky. After this many in a row we treat
+    # the job as gone.
     MAX_UNKNOWN = 3
     unknown_streak = 0
     try:
@@ -468,23 +437,14 @@ async def _watch_loop(job_id: str, interval: int) -> None:
 
             if state in TERMINAL_STATES:
                 info["final_summary"] = summary
-                message = f"[slurm-mcp] Job {job_id} {state}\n{summary}"
-                ok, detail = await _notify(message)
-                info["notified"] = ok
-                info["notify_detail"] = detail
                 return
 
             if state == "UNKNOWN":
                 unknown_streak += 1
                 if unknown_streak >= MAX_UNKNOWN:
-                    info["final_summary"] = summary
-                    message = (
-                        f"[slurm-mcp] Job {job_id} no longer visible "
-                        f"(final state unknown — sacct may be unavailable).\n{summary}"
+                    info["final_summary"] = (
+                        f"{summary}\n(Final state unknown — sacct may be unavailable.)"
                     )
-                    ok, detail = await _notify(message)
-                    info["notified"] = ok
-                    info["notify_detail"] = detail
                     return
             else:
                 unknown_streak = 0
@@ -497,12 +457,13 @@ async def _watch_loop(job_id: str, interval: int) -> None:
 
 @mcp.tool()
 async def watch_job(job_id: str, interval: int = 30) -> str:
-    """Register a background watcher that polls a job and fires a webhook on completion.
+    """Register a background watcher that polls a job until it reaches a terminal state.
 
-    Polls every ``interval`` seconds (min 10). Notifies via ``SLURM_MCP_NOTIFY_WEBHOOK``
-    when the job reaches a terminal state (COMPLETED, FAILED, TIMEOUT, CANCELLED, …).
-    Watchers live for the lifetime of the MCP server process; restarting loses them.
-    Returns immediately — use ``list_watches`` to inspect status.
+    Polls ``squeue``/``sacct`` every ``interval`` seconds (min 10). Records the
+    final state and a summary in the in-process watcher registry — use
+    ``list_watches`` to check. Watchers live for the lifetime of the MCP server
+    process; restarting loses them. For Slack/Discord notifications, run the
+    ``slack-notify`` skill after watching confirms a terminal state.
     """
     interval = max(10, int(interval))
     job_id = str(job_id).strip()
@@ -515,23 +476,16 @@ async def watch_job(job_id: str, interval: int = 30) -> str:
         return f"Could not find job {job_id}. Not watching.\n{summary}"
 
     if state in TERMINAL_STATES:
-        # Already done — fire once and record.
-        message = f"[slurm-mcp] Job {job_id} {state} (already terminal)\n{summary}"
-        ok, detail = await _notify(message)
+        # Already done — just record.
         _watchers[job_id] = {
             "started_at": time.time(),
             "finished_at": time.time(),
             "interval": interval,
             "last_state": state,
             "final_summary": summary,
-            "notified": ok,
-            "notify_detail": detail,
             "task": None,
         }
-        webhook_line = (
-            f"Webhook: {'sent' if ok else f'skipped ({detail})'}"
-        )
-        return f"Job {job_id} is already {state}; no polling needed.\n{webhook_line}\n\n{summary}"
+        return f"Job {job_id} is already {state}; no polling needed.\n\n{summary}"
 
     _watchers[job_id] = {
         "started_at": time.time(),
@@ -540,17 +494,11 @@ async def watch_job(job_id: str, interval: int = 30) -> str:
         "last_state": state,
         "last_check": time.time(),
         "final_summary": None,
-        "notified": None,
-        "notify_detail": None,
     }
     task = asyncio.create_task(_watch_loop(job_id, interval))
     _watchers[job_id]["task"] = task
 
-    webhook_status = "configured" if NOTIFY_WEBHOOK else "NOT configured (set SLURM_MCP_NOTIFY_WEBHOOK)"
-    return (
-        f"Watching job {job_id} (current state: {state}, interval: {interval}s). "
-        f"Webhook: {webhook_status}."
-    )
+    return f"Watching job {job_id} (current state: {state}, interval: {interval}s)."
 
 
 @mcp.tool()
@@ -560,20 +508,14 @@ async def list_watches() -> str:
         return "No watchers registered."
 
     now = time.time()
-    rows = ["JobID | State | Interval | Age | Notified"]
+    rows = ["JobID | State | Interval | Age | Status"]
     rows.append("-" * 70)
     for job_id, info in _watchers.items():
         age = int(now - info["started_at"])
-        notified = info.get("notified")
-        if notified is None:
-            notif = "pending"
-        elif notified is True:
-            notif = "sent"
-        else:
-            notif = f"failed ({info.get('notify_detail', '')})"
+        status = "finished" if info.get("finished_at") else "watching"
         rows.append(
             f"{job_id} | {info.get('last_state', '?')} | "
-            f"{info['interval']}s | {age}s | {notif}"
+            f"{info['interval']}s | {age}s | {status}"
         )
     return "\n".join(rows)
 

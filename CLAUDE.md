@@ -34,7 +34,7 @@ The entire server lives in `server.py` (~530 lines). It uses the `FastMCP` frame
 1. **Configuration** (top): Paths and quotas read from env vars (`SLURM_MCP_HOME_DIR`, `SLURM_MCP_DATA_DIR`, `SLURM_MCP_SCRATCH_DIR`, `SLURM_MCP_HOME_QUOTA_GB`) with sensible defaults. Data file extensions and directory names are also defined here.
 2. **Helpers**: `_storage_warnings()` validates file paths against cluster storage policy; `_run()` is the async subprocess executor (all Slurm/shell commands go through this).
 3. **Slurm Job Tools** (`@mcp.tool()`): `submit_job`, `list_jobs`, `cancel_job`, `job_status`, `tail_output` — wrap Slurm CLI commands (sbatch, squeue, scancel, sacct).
-4. **Watcher Tools**: `watch_job`, `list_watches` — background `asyncio.Task` per job, polls `sacct`, posts to `SLURM_MCP_NOTIFY_WEBHOOK` on terminal state. Watchers live in the module-level `_watchers` dict and do not persist across server restarts.
+4. **Watcher Tools**: `watch_job`, `list_watches` — background `asyncio.Task` per job, polls `squeue` (then `sacct` as fallback) and records terminal state in the module-level `_watchers` dict. Watchers do not persist across server restarts. No built-in notification; pair with the `slack-notify` skill if needed.
 5. **File Tools**: `read_file`, `write_file`, `edit_file`, `search_files`, `delete_file`, `disk_usage` — file I/O with storage policy enforcement that warns when data files target the home directory.
 6. **System/Git Tools**: `run_command` (arbitrary shell with safety blocklist), `sync_code` (git pull), `cluster_info` (sinfo).
 7. **Entry point**: `mcp.run()` at the bottom.
@@ -47,7 +47,6 @@ The entire server lives in `server.py` (~530 lines). It uses the `FastMCP` frame
 - **`submit_job` supports inline scripts**: if `script_content` is provided instead of `script_path`, it writes a temp file to the working directory.
 - **Preamble injection**: when `SLURM_MCP_PREAMBLE` is set, its contents are prepended after the shebang of inline `script_content` (not applied to `script_path` — that file is owned by the caller).
 - **Auto-QOS**: when `partition` is in `HPGPU_PARTITIONS` and `extra_args` contains no `--qos` / `-q`, `--qos=hpgpu` is injected. Extend `HPGPU_PARTITIONS` when cluster policy changes.
-- **Webhook notifications** use stdlib `urllib` via `asyncio.to_thread`; no extra dependency. The payload includes both `text` (Slack) and `content` (Discord) keys for compatibility.
 
 ## Configuration
 
@@ -60,7 +59,6 @@ All paths are configurable via environment variables:
 | `SLURM_MCP_SCRATCH_DIR` | `/scratch` | Temporary staging |
 | `SLURM_MCP_HOME_QUOTA_GB` | `500` | Home directory quota for warnings |
 | `SLURM_MCP_PREAMBLE` | *(empty)* | Shell lines injected after shebang of inline job scripts |
-| `SLURM_MCP_NOTIFY_WEBHOOK` | *(empty)* | Webhook URL for job-completion notifications |
 
 ## Storage Policy (enforced in code)
 

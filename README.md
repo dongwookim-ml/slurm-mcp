@@ -7,7 +7,7 @@ The server runs on your cluster's login node and exposes Slurm operations, file 
 ## Features
 
 - **Job Management** — submit (`sbatch`), list (`squeue`), cancel (`scancel`), status (`sacct`), and tail output
-- **Job Watcher** — background polling with webhook notification on terminal state
+- **Job Watcher** — background polling that records terminal state in-process (inspect via `list_watches`)
 - **Preamble Injection** — prepend module loads / env setup into every inline job script
 - **Auto-QOS** — automatic `--qos=hpgpu` when targeting partitions that require it
 - **File Operations** — read, write, edit, search, and delete files with storage policy enforcement
@@ -74,7 +74,6 @@ Once configured, Claude Code can directly interact with your cluster:
 | `SLURM_MCP_SCRATCH_DIR` | `/scratch` | Temporary staging area |
 | `SLURM_MCP_HOME_QUOTA_GB` | `500` | Home quota threshold for warnings |
 | `SLURM_MCP_PREAMBLE` | *(empty)* | Shell lines injected after the shebang into inline job scripts (e.g. `module load cuda/12.1\nsource ~/.venv/bin/activate`) |
-| `SLURM_MCP_NOTIFY_WEBHOOK` | *(empty)* | Slack/Discord-compatible webhook URL used by `watch_job` on terminal state |
 
 ### Auto-QOS
 
@@ -84,11 +83,12 @@ When `submit_job` targets a partition in `{A100-40GB, A100-80GB, 4A100}` and no
 
 ### Watchers
 
-`watch_job <id>` registers an async watcher that polls `sacct` every 30 s
-(configurable). When the job reaches a terminal state (`COMPLETED`, `FAILED`,
-`TIMEOUT`, `CANCELLED`, `OUT_OF_MEMORY`, …) the server posts a summary to
-`SLURM_MCP_NOTIFY_WEBHOOK`. Watchers live in-process and are lost if the server
-restarts. Use `list_watches` to inspect state.
+`watch_job <id>` registers an async watcher that polls `squeue` (falling back
+to `sacct`) every 30 s (configurable). When the job reaches a terminal state
+(`COMPLETED`, `FAILED`, `TIMEOUT`, `CANCELLED`, `OUT_OF_MEMORY`, …) the final
+state and a summary are stored in the in-process watcher registry. Use
+`list_watches` to inspect. Watchers live in-process and are lost if the server
+restarts.
 
 Set these in your shell profile or pass them when running the server:
 
