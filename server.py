@@ -387,48 +387,85 @@ _watchers: dict[str, dict] = {}
 
 
 async def _poll_job_state(job_id: str) -> tuple[str, str]:
-    """Return (state, summary). State is SACCT state; summary includes key fields."""
+    """Return (state, summary).
+
+    Strategy: prefer squeue (live, fast, works without slurmdbd) while the
+    job is in the queue. Fall back to sacct for terminal state after the job
+    leaves the queue. If both fail, return ``UNKNOWN`` — callers can decide
+    how to treat it (e.g. the watcher loop tolerates a few UNKNOWN polls in
+    a row before giving up, which handles flaky slurmdbd).
+    """
+    # 1) squeue — live state for pending/running/completing jobs
+    sq_out, _, sq_rc = await _run(
+        ["squeue", "-j", str(job_id), "--format=%i|%j|%T|%M|%l|%R|%P", "--noheader"],
+        timeout=10,
+    )
+    if sq_rc == 0 and sq_out.strip():
+        parts = sq_out.strip().splitlines()[0].split("|")
+        keys = ["JobID", "JobName", "State", "Elapsed", "TimeLimit", "Reason", "Partition"]
+        info = dict(zip(keys, parts))
+        state = info.get("State", "UNKNOWN").strip() or "UNKNOWN"
+        summary = "\n".join([
+            f"Job: {info.get('JobID', job_id)} ({info.get('JobName', '')})",
+            f"State: {state} (via squeue)",
+            f"Partition: {info.get('Partition', '')}",
+            f"Elapsed: {info.get('Elapsed', '')} / {info.get('TimeLimit', '')}",
+            f"Reason/Node: {info.get('Reason', '')}",
+        ])
+        return state, summary
+
+    # 2) sacct — terminal state after the job left the queue
     fmt = "JobID,JobName,State,ExitCode,Elapsed,MaxRSS,NodeList"
-    out, err, rc = await _run(
+    sa_out, sa_err, sa_rc = await _run(
         ["sacct", "-j", str(job_id), f"--format={fmt}", "--parsable2", "--noheader"],
         timeout=15,
     )
-    if rc != 0 or not out:
-        return "UNKNOWN", err or "no sacct output"
+    if sa_rc == 0 and sa_out.strip():
+        first = sa_out.splitlines()[0].split("|")
+        fields = fmt.split(",")
+        info = dict(zip(fields, first))
+        state_raw = info.get("State", "UNKNOWN")
+        # sacct appends " by <uid>" on CANCELLED; strip.
+        state = state_raw.split()[0] if state_raw else "UNKNOWN"
 
-    # Use the first row (the parent step) for state; it's the canonical job state.
-    first = out.splitlines()[0].split("|")
-    fields = fmt.split(",")
-    info = dict(zip(fields, first))
-    state_raw = info.get("State", "UNKNOWN")
-    # sacct appends " by <uid>" on CANCELLED; strip.
-    state = state_raw.split()[0] if state_raw else "UNKNOWN"
+        summary_lines = [
+            f"Job: {info.get('JobID', job_id)} ({info.get('JobName', '')})",
+            f"State: {state_raw} (via sacct)",
+            f"ExitCode: {info.get('ExitCode', '')}",
+            f"Elapsed: {info.get('Elapsed', '')}",
+        ]
+        if info.get("NodeList"):
+            summary_lines.append(f"Nodes: {info['NodeList']}")
+        # MaxRSS often lives on the .batch step; scan for it.
+        for row in sa_out.splitlines():
+            parts = row.split("|")
+            if len(parts) > fields.index("MaxRSS") and parts[fields.index("MaxRSS")]:
+                summary_lines.append(f"MaxRSS: {parts[fields.index('MaxRSS')]}")
+                break
+        return state, "\n".join(summary_lines)
 
-    summary_lines = [
-        f"Job: {info.get('JobID', job_id)} ({info.get('JobName', '')})",
-        f"State: {state_raw}",
-        f"ExitCode: {info.get('ExitCode', '')}",
-        f"Elapsed: {info.get('Elapsed', '')}",
-    ]
-    if info.get("NodeList"):
-        summary_lines.append(f"Nodes: {info['NodeList']}")
-    # MaxRSS often lives on the .batch step; scan for it.
-    for row in out.splitlines():
-        parts = row.split("|")
-        if len(parts) > fields.index("MaxRSS") and parts[fields.index("MaxRSS")]:
-            summary_lines.append(f"MaxRSS: {parts[fields.index('MaxRSS')]}")
-            break
-    return state, "\n".join(summary_lines)
+    # 3) Neither source had data. Distinguish "dbd unavailable" from "not found".
+    if sa_err and "Connection refused" in sa_err:
+        detail = f"Job {job_id}: not in squeue; sacct unavailable (slurmdbd down)"
+    else:
+        detail = f"Job {job_id}: not found in squeue or sacct"
+    return "UNKNOWN", detail
 
 
 async def _watch_loop(job_id: str, interval: int) -> None:
     info = _watchers[job_id]
+    # Tolerate a few UNKNOWN polls: job may have just finished before sacct
+    # indexed it, or slurmdbd may be flaky. After this many in a row we assume
+    # the job is gone and notify with a caveat.
+    MAX_UNKNOWN = 3
+    unknown_streak = 0
     try:
         while True:
             await asyncio.sleep(interval)
             state, summary = await _poll_job_state(job_id)
             info["last_state"] = state
             info["last_check"] = time.time()
+
             if state in TERMINAL_STATES:
                 info["final_summary"] = summary
                 message = f"[slurm-mcp] Job {job_id} {state}\n{summary}"
@@ -436,6 +473,21 @@ async def _watch_loop(job_id: str, interval: int) -> None:
                 info["notified"] = ok
                 info["notify_detail"] = detail
                 return
+
+            if state == "UNKNOWN":
+                unknown_streak += 1
+                if unknown_streak >= MAX_UNKNOWN:
+                    info["final_summary"] = summary
+                    message = (
+                        f"[slurm-mcp] Job {job_id} no longer visible "
+                        f"(final state unknown — sacct may be unavailable).\n{summary}"
+                    )
+                    ok, detail = await _notify(message)
+                    info["notified"] = ok
+                    info["notify_detail"] = detail
+                    return
+            else:
+                unknown_streak = 0
     except asyncio.CancelledError:
         info["last_state"] = info.get("last_state", "CANCELLED_WATCH")
         raise
@@ -460,7 +512,7 @@ async def watch_job(job_id: str, interval: int = 30) -> str:
 
     state, summary = await _poll_job_state(job_id)
     if state == "UNKNOWN":
-        return f"Could not find job {job_id} in sacct. Not watching."
+        return f"Could not find job {job_id}. Not watching.\n{summary}"
 
     if state in TERMINAL_STATES:
         # Already done — fire once and record.
